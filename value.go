@@ -171,6 +171,10 @@ func (lf *logFile) decryptKV(buf []byte, offset uint32) ([]byte, error) {
 	return y.XORBlock(buf, lf.dataKey.Data, lf.generateIV(offset))
 }
 
+func (lf *logFile) decryptKVReader(in io.Reader, out io.Writer, offset uint32) error {
+	return y.XORReader(in, out, lf.dataKey.Data, lf.generateIV(offset))
+}
+
 // KeyID returns datakey's ID.
 func (lf *logFile) keyID() uint64 {
 	if lf.dataKey == nil {
@@ -241,6 +245,74 @@ func (lf *logFile) read(p valuePointer, s *y.Slice) (buf []byte, err error) {
 	y.NumReads.Add(1)
 	y.NumBytesRead.Add(nbr)
 	return buf, err
+}
+
+// Acquire lock on mmap/file if you are calling this
+func (lf *logFile) readAsync(p valuePointer, s *y.Slice) (out io.ReadCloser, err error) {
+	reader, writer := io.Pipe()
+	out = reader
+
+	var nbr int64
+	offset := p.Offset
+	if lf.loadingMode == options.FileIO {
+		pLength := int(p.Len)
+
+		go func() {
+			const bufferSize = 256
+
+			lastRead := pLength % bufferSize
+			reads := (pLength-lastRead)/bufferSize + 1
+
+			buf := s.Resize(bufferSize)
+			var readBytes int
+			for i := 0; i < reads; i++ {
+				// last read - use different buffer
+				if i == (reads - 1) {
+					buf = s.Resize(lastRead)
+				}
+
+				readBytes, err = lf.fd.ReadAt(buf, int64(offset)+int64(i*bufferSize))
+				y.NumBytesRead.Add(int64(readBytes))
+				if err != nil {
+					writer.CloseWithError(err)
+					return
+				}
+
+				_, err = writer.Write(buf[:readBytes])
+				if err != nil {
+					writer.CloseWithError(err)
+					return
+				}
+			}
+
+			writer.Close()
+		}()
+	} else {
+		// Do not convert size to uint32, because the lf.fmap can be of size
+		// 4GB, which overflows the uint32 during conversion to make the size 0,
+		// causing the read to fail with ErrEOF. See issue #585.
+		size := int64(len(lf.fmap))
+		valsz := p.Len
+		lfsz := atomic.LoadUint32(&lf.size)
+		if int64(offset) >= size || int64(offset+valsz) > size ||
+			// Ensure that the read is within the file's actual size. It might be possible that
+			// the offset+valsz length is beyond the file's actual size. This could happen when
+			// dropAll and iterations are running simultaneously.
+			int64(offset+valsz) > int64(lfsz) {
+			err = y.ErrEOF
+
+			// TODO ???
+			reader.Close()
+			writer.Close()
+		} else {
+			nbr = int64(valsz)
+			_, err = writer.Write(lf.fmap[offset : offset+valsz])
+			writer.Close()
+		}
+		y.NumBytesRead.Add(nbr)
+	}
+	y.NumReads.Add(1)
+	return reader, err
 }
 
 // generateIV will generate IV by appending given offset with the base IV.
@@ -1451,6 +1523,69 @@ func (vlog *valueLog) Read(vp valuePointer, s *y.Slice) ([]byte, func(), error) 
 	return kv[h.klen : h.klen+h.vlen], cb, nil
 }
 
+// Read reads the value log at a given location.
+// TODO: Make this read private.
+func (vlog *valueLog) ReadToWriter(vp valuePointer, s *y.Slice, dst io.Writer) (func(), error) {
+	// Check for valid offset if we are reading from writable log.
+	maxFid := atomic.LoadUint32(&vlog.maxFid)
+	if vp.Fid == maxFid && vp.Offset >= vlog.woffset() {
+		return nil, errors.Errorf(
+			"Invalid value pointer offset: %d greater than current offset: %d",
+			vp.Offset, vlog.woffset())
+	}
+	buf, lf, err := vlog.readValueReader(vp, s)
+	defer buf.Close()
+	// log file is locked so, decide whether to lock immediately or let the caller to
+	// unlock it, after caller uses it.
+	cb := vlog.getUnlockCallback(lf)
+	if err != nil {
+		return cb, err
+	}
+
+	// TODO
+	//if vlog.opt.VerifyValueChecksum {
+	//	hash := crc32.New(y.CastagnoliCrcTable)
+	//	if _, err := hash.Write(buf[:len(buf)-crc32.Size]); err != nil {
+	//		runCallback(cb)
+	//		return nil, errors.Wrapf(err, "failed to write hash for vp %+v", vp)
+	//	}
+	//	// Fetch checksum from the end of the buffer.
+	//	checksum := buf[len(buf)-crc32.Size:]
+	//	if hash.Sum32() != y.BytesToU32(checksum) {
+	//		runCallback(cb)
+	//		return nil, errors.Wrapf(y.ErrChecksumMismatch, "value corrupted for vp: %+v", vp)
+	//	}
+	//}
+	var h header
+	_, err = h.DecodeFrom(newHashReader(buf))
+	if err != nil {
+		return cb, err
+	}
+
+	if lf.encryptionEnabled() {
+		// TODO: Pipe away h.klen, and ignore everything after h.vlen
+		err = lf.decryptKVReader(buf, dst, vp.Offset)
+		return cb, err
+	}
+
+	// Discard the key
+	if _, err := io.CopyN(ioutil.Discard, buf, int64(h.klen)); err != nil {
+		return cb, err
+	}
+
+	// Read the value
+	if _, err := io.CopyN(dst, buf, int64(h.vlen)); err != nil {
+		return cb, err
+	}
+
+	// Read away the rest
+	if _, err := io.Copy(ioutil.Discard, buf); err != nil {
+		return cb, err
+	}
+
+	return cb, nil
+}
+
 // getUnlockCallback will returns a function which unlock the logfile if the logfile is mmaped.
 // otherwise, it unlock the logfile and return nil.
 func (vlog *valueLog) getUnlockCallback(lf *logFile) func() {
@@ -1473,6 +1608,17 @@ func (vlog *valueLog) readValueBytes(vp valuePointer, s *y.Slice) ([]byte, *logF
 	}
 	buf, err := lf.read(vp, s)
 	return buf, lf, err
+}
+
+// readValueReader return vlog entry slice and read locked log file. Caller should take care of
+// logFile unlocking.
+func (vlog *valueLog) readValueReader(vp valuePointer, s *y.Slice) (io.ReadCloser, *logFile, error) {
+	lf, err := vlog.getFileRLocked(vp.Fid)
+	if err != nil {
+		return nil, nil, err
+	}
+	reader, err := lf.readAsync(vp, s)
+	return reader, lf, err
 }
 
 func (vlog *valueLog) pickLog(head valuePointer, tr trace.Trace) (files []*logFile) {

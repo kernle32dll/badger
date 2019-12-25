@@ -20,6 +20,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"io"
 )
 
 // XORBlock encrypts the given data with AES and XOR's with IV.
@@ -34,6 +35,37 @@ func XORBlock(src, key, iv []byte) ([]byte, error) {
 	dst := make([]byte, len(src))
 	stream.XORKeyStream(dst, src)
 	return dst, nil
+}
+
+func XORReader(in io.Reader, out io.Writer, key, iv []byte) error {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return err
+	}
+	stream := cipher.NewCTR(block, iv)
+
+	const bufferSize = 1024
+	bufIn := make([]byte, bufferSize)
+	bufOut := make([]byte, bufferSize)
+
+	for {
+		bytesRead, err := in.Read(bufIn)
+		if err != nil && err != io.EOF {
+			return err
+		}
+
+		stream.XORKeyStream(bufOut[:bytesRead], bufIn[:bytesRead])
+
+		if _, wErr := out.Write(bufIn[:bytesRead]); wErr != nil {
+			return wErr
+		}
+
+		if err == io.EOF {
+			break
+		}
+	}
+
+	return nil
 }
 
 // GenerateIV generates IV.
